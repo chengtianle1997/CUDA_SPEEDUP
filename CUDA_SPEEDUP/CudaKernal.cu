@@ -43,6 +43,7 @@ cudaError_t checkCudaError(cudaError_t CudaFunction, const char* ident) {
 	return err;
 }
 
+
 //Coloncel行扫描得点存储
 __global__ void GetGaussPointCuda(PtrStepSz<uchar1> src, MPoint *point, int **gpu_data, int Colonce, int Rows, int Cols) {
 	int threadId = threadIdx.x;
@@ -81,6 +82,81 @@ __global__ void GetGaussPointCuda(PtrStepSz<uchar1> src, MPoint *point, int **gp
 	__syncthreads();
 }
 
+__global__ void GetAlmostRes(MPoint *point, int **gpu_data, double maxError, double minError, int yRange, int Rows, int Cols)
+{
+	//通过块并行解决一个block内thread不够用的问题
+	int threadId = blockIdx.x*blockDim.x + threadIdx.x;
+	//判断以确定该线程有可处理数据
+	if (threadId < Cols)
+	{
+		////高斯点存储申请
+		GPoint *gpoint = new GPoint[2 * yRange];
+		int Pixnum = 0; //统计高斯点个数
+		//确定上下界位置 减少计算次数
+		double minLine = minError * point[threadId].bright;
+		double maxLine = (1 - maxError) * point[threadId].bright;
+		//高斯点筛选
+		for (int i = (point[threadId].y - yRange); i < (point[threadId].y + yRange + 1); i++)
+		{
+			if ((gpu_data[threadId][i] > minLine) && (gpu_data[threadId][i] < maxLine))
+			{
+				gpoint[Pixnum].x = i;
+				gpoint[Pixnum].brightness = gpu_data[threadId][i];
+				Pixnum++;
+			}
+		}
+		point[threadId].Pixnum = Pixnum;
+		//最大似然估计
+		int usum =0;
+		for (int i = 0; i < Pixnum; i++)
+		{
+			usum += gpoint[Pixnum].x;
+		}
+		point[threadId].cx = threadId;
+		point[threadId].cy = 1.0*usum / Pixnum;
+		printf("usum=%d,ax=%d", usum, ax);
+		delete[] gpoint;
+	}
+	__syncthreads();
+}
+//加权平均
+__global__ void GetAxAverage(MPoint *point, int **gpu_data, double maxError, double minError, int yRange, int Rows, int Cols) {
+	int threadId = blockIdx.x*blockDim.x + threadIdx.x;
+	//判断以确定该线程有可处理数据
+	if (threadId < Cols)
+	{
+		////高斯点存储申请
+		GPoint *gpoint = new GPoint[2 * yRange];
+		int Pixnum = 0; //统计高斯点个数
+		//确定上下界位置 减少计算次数
+		double minLine = minError * point[threadId].bright;
+		double maxLine = (1 - maxError) * point[threadId].bright;
+		//高斯点筛选
+		for (int i = (point[threadId].y - yRange); i < (point[threadId].y + yRange + 1); i++)
+		{
+			if ((gpu_data[threadId][i] > minLine) && (gpu_data[threadId][i] < maxLine))
+			{
+				gpoint[Pixnum].x = i;
+				gpoint[Pixnum].brightness = gpu_data[threadId][i];
+				Pixnum++;
+			}
+		}
+		point[threadId].Pixnum = Pixnum;
+		//加权平均
+		int usum = 0;
+		int ax = 0;
+		for (int i = 0; i < Pixnum; i++)
+		{
+			usum += gpoint[Pixnum].x*gpoint[Pixnum].brightness*gpoint[Pixnum].brightness;
+			ax += gpoint[Pixnum].brightness*gpoint[Pixnum].brightness;
+		}
+		point[threadId].cx = threadId;
+		point[threadId].cy = usum*1.0/ ax;
+		//printf("usum=%d,ax=%d", usum, ax);
+		delete[] gpoint;
+	}
+	__syncthreads();
+}
 //按列筛选并处理高斯点
 __global__ void GetGaussFitRes(MPoint *point, MatrixUnion *gpu_mar, int **gpu_data, double maxError, double minError, int yRange, int Rows, int Cols, int Precision)
 {
@@ -486,107 +562,6 @@ __global__ void GetGaussFitRes(MPoint *point, MatrixUnion *gpu_mar, int **gpu_da
 
 }
 
-//高斯点筛选
-//for (int i = 0; i < Colonce; i++)
-//{
-//	int Pixnum = 0;
-//	//GPoint *gpoint;
-//	//point[threadId*Colonce+i].gpoint = new GPoint[Rows];
-//	//point[i].gpoint = new GPoint[Rows];
-//	for (int j = 0; j < Rows; j++)
-//	{
-//		if ((gpu_cr[Rows*i + j] > minError*point[threadId*Colonce + i].bright)
-//			&& (gpu_cr[Rows*i + j] < (1 - maxError)*point[threadId*Colonce + i].bright)
-//			&& (abs(j - point[threadId*Colonce + i].y) < yRange))
-//		{
-//			point[threadId*Colonce + i].gpoint[Pixnum].x = threadId * Colonce + i;
-//			point[threadId*Colonce + i].gpoint[Pixnum].brightness = gpu_cr[Rows*i + j];
-//			Pixnum++;
-//		}
-//		if ((j - point[threadId*Colonce + i].y) < yRange)
-//			break;
-//	}
-//	point[threadId*Colonce + i].Pixnum = Pixnum;
-
-	/*
-	//矩阵运算
-	if (Pixnum >= 3)
-	{
-		__shared__ int *X;
-		X = new int[Pixnum * 3];
-		__shared__ int *Z;
-		Z = new int[Pixnum];
-		//计算能力<3.5 不能嵌套并行核函数
-		//dim3 blockSEX(1, 0, 0);
-		//dim3 threadSEX(Pixnum, 0, 0);
-		//存入X、Z矩阵
-		//SetElementX << <blockSEX, threadSEX >> > (gpoint, X, Pixnum);
-		//存入X矩阵(n*3) Z矩阵（n*1)
-		for (int i = 0; i < Pixnum; i++)
-		{
-			for (int j = 0; j < 3; j++)
-			{
-				if (j = 0)
-				{
-					X[i * 3 + j] = 1;
-				}
-				if (j = 1)
-				{
-					X[i * 3 + j] = gpoint[i].x;
-				}
-				if (j = 2)
-				{
-					X[i * 3 + j] = gpoint[i].x*gpoint[i].x;
-				}
-			}
-			Z[i] = gpoint[i].brightness;
-		}
-		//求X转置
-		__shared__ int *XT;
-		XT = new int[Pixnum* 3];
-		for (int i = 0; i < 3; i++)
-		{
-			for (int j = 0; j < Pixnum; j++)
-			{
-				XT[i*Pixnum + j] = X[j * 3 + i];
-			}
-		}
-		//求XT*X结果
-		__shared__ int *SA;
-		SA = new int[3 * 3];
-		for (int m = 0; i < 3; i++)
-		{
-			for (int s = 0; s < 3; s++)
-			{
-				for (int n = 0; n < Pixnum; n++)
-				{
-					SA[m * 3 + s] = XT[m*Pixnum + n] * X[n * 3 + s];
-				}
-			}
-		}
-		//求SA逆矩阵
-		__shared__ int *SAN;
-		SAN = new int[3 * 3];
-
-
-	}*/
-	//}
-	//delete &gpu_cr;
-
-
-//#define N 3
-//__global__ void MatAdd(const int **A, const int **B, int **C)
-//{
-//	int i = threadIdx.x;
-//	int j = threadIdx.y;
-//	C[i][j] = A[i][j] + B[i][j];
-//	//__syncthreads();
-//}
-
-
-
-//extern "C" void GetGaussFitCuda(GpuMat gpuMat, MPoint *point, double maxError, double minError, int yRange, int Colonce);
-
 extern "C"
 void CudaGuassHC(Mat matImage, MPoint *point, double maxError, double minError, int yRange, int Colonce, int Precision) {
 
@@ -657,8 +632,12 @@ void CudaGuassHC(Mat matImage, MPoint *point, double maxError, double minError, 
 	}
 	*/
 	//进行高斯拟合
-	GetGaussFitRes << <Blocknum, Threadnum >> > (gpu_point, gpu_mar, gpu_data, maxError, minError, yRange, Rows, Cols, Precision);
-	cudaDeviceSynchronize();
+	//GetGaussFitRes << <Blocknum, Threadnum >> > (gpu_point, gpu_mar, gpu_data, maxError, minError, yRange, Rows, Cols, Precision);
+	//最大似然估计
+	//GetAlmostRes<<<Blocknum, Threadnum >>>(gpu_point, gpu_data, maxError, minError, yRange, Rows, Cols);
+	//加权平均
+	GetAxAverage << <Blocknum, Threadnum >> > (gpu_point, gpu_data, maxError, minError, yRange, Rows, Cols);
+	//cudaDeviceSynchronize();
 	checkCudaError(cudaMemcpy(point, gpu_point, sizeof(MPoint)*Cols, cudaMemcpyDeviceToHost), "memcpy down error1");
 
 	for (int i = 0; i < Cols; i++)
@@ -685,8 +664,4 @@ void CudaGuassHC(Mat matImage, MPoint *point, double maxError, double minError, 
 	gpuMat.release();
 }
 
-extern "C" void GuassFitGpuHcT(Mat matImage, MPoint *point, double maxError, double minError, int yRange, int Colonce)
-{
-
-}
 
